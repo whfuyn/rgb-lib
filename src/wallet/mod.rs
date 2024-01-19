@@ -4005,6 +4005,19 @@ impl Wallet {
     /// When an `asset_id` is not provided, return transfers that are not connected to a specific
     /// asset.
     pub fn list_transfers(&self, asset_id: Option<String>) -> Result<Vec<Transfer>, Error> {
+        self.list_transfers_inner(asset_id, false)
+    }
+
+    /// List all RGB [`Transfer`]s known to the wallet.
+    pub fn list_all_transfers(&self) -> Result<Vec<Transfer>, Error> {
+        self.list_transfers_inner(None, true)
+    }
+
+    fn list_transfers_inner(
+        &self,
+        asset_id: Option<String>,
+        list_all_transfers: bool,
+    ) -> Result<Vec<Transfer>, Error> {
         if let Some(asset_id) = &asset_id {
             info!(self.logger, "Listing transfers for asset '{}'...", asset_id);
             self.database.check_asset_exists(asset_id.clone())?;
@@ -4015,7 +4028,7 @@ impl Wallet {
         let asset_transfer_ids: Vec<i32> = db_data
             .asset_transfers
             .iter()
-            .filter(|t| t.asset_id == asset_id)
+            .filter(|t| list_all_transfers || t.asset_id == asset_id)
             .filter(|t| t.user_driven)
             .map(|t| t.idx)
             .collect();
