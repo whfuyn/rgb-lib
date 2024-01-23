@@ -245,6 +245,7 @@ impl LocalRgbAllocation {
 
 #[derive(Debug)]
 pub(crate) struct TransferData {
+    pub(crate) asset_id: Option<String>,
     pub(crate) kind: TransferKind,
     pub(crate) status: TransferStatus,
     pub(crate) txid: Option<String>,
@@ -856,6 +857,7 @@ impl RgbLibDatabase {
         };
 
         Ok(TransferData {
+            asset_id: asset_transfer.asset_id.clone(),
             kind,
             status: batch_transfer.status,
             txid: batch_transfer.txid.clone(),
