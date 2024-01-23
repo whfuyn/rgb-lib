@@ -1053,6 +1053,8 @@ pub enum TransactionType {
 pub struct Transfer {
     /// ID of the transfer
     pub idx: i32,
+    /// ID of the asset
+    pub asset_id: Option<String>,
     /// Timestamp of the transfer creation
     pub created_at: i64,
     /// Timestamp of the transfer last update
@@ -1085,6 +1087,7 @@ impl Transfer {
     ) -> Transfer {
         Transfer {
             idx: x.idx,
+            asset_id: td.asset_id,
             created_at: td.created_at,
             updated_at: td.updated_at,
             status: td.status,
@@ -4024,26 +4027,30 @@ impl Wallet {
         } else {
             info!(self.logger, "Listing transfers...");
         }
+
         let db_data = self.database.get_db_data(false)?;
-        let asset_transfer_ids: Vec<i32> = db_data
+        let asset_transfers: Vec<&DbAssetTransfer> = db_data
             .asset_transfers
             .iter()
             .filter(|t| list_all_transfers || t.asset_id == asset_id)
             .filter(|t| t.user_driven)
-            .map(|t| t.idx)
             .collect();
         let transfers: Vec<Transfer> = db_data
             .transfers
-            .into_iter()
-            .filter(|t| asset_transfer_ids.contains(&t.asset_transfer_idx))
+            .iter()
+            .filter(|t| {
+                asset_transfers
+                    .iter()
+                    .any(|asset_transfer| asset_transfer.idx == t.asset_transfer_idx)
+            })
             .map(|t| {
                 let (asset_transfer, batch_transfer) =
                     t.related_transfers(&db_data.asset_transfers, &db_data.batch_transfers)?;
                 let tte_data = self.database.get_transfer_transport_endpoints_data(t.idx)?;
                 Ok(Transfer::from_db_transfer(
-                    &t,
+                    t,
                     self.database.get_transfer_data(
-                        &t,
+                        t,
                         &asset_transfer,
                         &batch_transfer,
                         &db_data.txos,
