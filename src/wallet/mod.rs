@@ -211,7 +211,7 @@ impl AssetIface {
         )?;
         let issued_supply = asset.issued_supply.parse::<u64>().unwrap();
         Ok(match &self {
-            AssetIface::RGB20 => AssetType::AssetNIA(AssetNIA {
+            AssetIface::RGB20 => AssetType::Nia(AssetNIA {
                 asset_id: asset.id.clone(),
                 asset_iface: self.clone(),
                 ticker: asset.ticker.clone().unwrap(),
@@ -224,7 +224,7 @@ impl AssetIface {
                 balance,
                 media,
             }),
-            AssetIface::RGB21 => AssetType::AssetUDA(AssetUDA {
+            AssetIface::RGB21 => AssetType::Uda(AssetUDA {
                 asset_id: asset.id.clone(),
                 asset_iface: self.clone(),
                 details: asset.details.clone(),
@@ -237,7 +237,7 @@ impl AssetIface {
                 balance,
                 token,
             }),
-            AssetIface::RGB25 => AssetType::AssetCFA(AssetCFA {
+            AssetIface::RGB25 => AssetType::Cfa(AssetCFA {
                 asset_id: asset.id.clone(),
                 asset_iface: self.clone(),
                 name: asset.name.clone(),
@@ -392,7 +392,7 @@ impl AssetNIA {
             txos,
             medias,
         )? {
-            AssetType::AssetNIA(asset) => Ok(asset),
+            AssetType::Nia(asset) => Ok(asset),
             _ => unreachable!("impossible"),
         }
     }
@@ -507,7 +507,7 @@ impl AssetUDA {
             txos,
             None,
         )? {
-            AssetType::AssetUDA(asset) => Ok(asset),
+            AssetType::Uda(asset) => Ok(asset),
             _ => unreachable!("impossible"),
         }
     }
@@ -560,7 +560,7 @@ impl AssetCFA {
             txos,
             medias,
         )? {
-            AssetType::AssetCFA(asset) => Ok(asset),
+            AssetType::Cfa(asset) => Ok(asset),
             _ => unreachable!("impossible"),
         }
     }
@@ -568,14 +568,14 @@ impl AssetCFA {
 
 /// An enum for asset of different types.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-#[serde(tag = "type")]
+#[serde(tag = "schema", rename_all = "UPPERCASE")]
 pub enum AssetType {
     /// NIA asset
-    AssetNIA(AssetNIA),
+    Nia(AssetNIA),
     /// UDA asset
-    AssetUDA(AssetUDA),
+    Uda(AssetUDA),
     /// CFA asset
-    AssetCFA(AssetCFA),
+    Cfa(AssetCFA),
 }
 
 /// List of RGB assets, grouped by asset schema.
@@ -3869,7 +3869,7 @@ impl Wallet {
         };
         let ret = match asset.schema {
             AssetSchema::Nia => {
-                let ret = AssetNIA::get_asset_details(
+                let nia = AssetNIA::get_asset_details(
                     self,
                     &asset,
                     transfers,
@@ -3879,7 +3879,7 @@ impl Wallet {
                     txos,
                     medias,
                 )?;
-                AssetType::AssetNIA(ret)
+                AssetType::Nia(nia)
             }
             AssetSchema::Uda => {
                 let token = {
@@ -3903,7 +3903,7 @@ impl Wallet {
                     colorings,
                     txos,
                 )?;
-                AssetType::AssetUDA(uda)
+                AssetType::Uda(uda)
             }
             AssetSchema::Cfa => {
                 let cfa = AssetCFA::get_asset_details(
@@ -3916,7 +3916,7 @@ impl Wallet {
                     txos,
                     medias,
                 )?;
-                AssetType::AssetCFA(cfa)
+                AssetType::Cfa(cfa)
             }
         };
         Ok(Some(ret))
