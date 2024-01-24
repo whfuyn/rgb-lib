@@ -566,9 +566,15 @@ impl AssetCFA {
     }
 }
 
-enum AssetType {
+/// An enum for asset of different types.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(tag = "type")]
+pub enum AssetType {
+    /// NIA asset
     AssetNIA(AssetNIA),
+    /// UDA asset
     AssetUDA(AssetUDA),
+    /// CFA asset
     AssetCFA(AssetCFA),
 }
 
@@ -3842,6 +3848,73 @@ impl Wallet {
             asset_medias.push(Media::from_db_media(&db_media, self._media_dir()))
         }
         Ok(asset_medias)
+    }
+
+    /// Get the details of the asset with the provided `asset_id`.
+    pub fn get_asset(&self, asset_id: String) -> Result<Option<AssetType>, Error> {
+        let batch_transfers = Some(self.database.iter_batch_transfers()?);
+        let colorings = Some(self.database.iter_colorings()?);
+        let txos = Some(self.database.iter_txos()?);
+        let asset_transfers = Some(self.database.iter_asset_transfers()?);
+        let transfers = Some(self.database.iter_transfers()?);
+        let medias = Some(self.database.iter_media()?);
+
+        let Some(asset) = self.database.get_asset(asset_id)? else {
+            return Ok(None);
+        };
+        let ret = match asset.schema {
+            AssetSchema::Nia => {
+                let ret = AssetNIA::get_asset_details(
+                    self,
+                    &asset,
+                    transfers,
+                    asset_transfers,
+                    batch_transfers,
+                    colorings,
+                    txos,
+                    medias,
+                )?;
+                AssetType::AssetNIA(ret)
+            }
+            AssetSchema::Uda => {
+                let token = {
+                    let tokens = self.database.iter_tokens()?;
+                    let token_medias = self.database.iter_token_medias()?;
+                    self._get_asset_token(
+                        asset.idx,
+                        &medias.clone().unwrap(),
+                        &tokens,
+                        &token_medias,
+                    )?
+                };
+
+                let uda = AssetUDA::get_asset_details(
+                    self,
+                    &asset,
+                    token,
+                    transfers,
+                    asset_transfers,
+                    batch_transfers,
+                    colorings,
+                    txos,
+                )?;
+                AssetType::AssetUDA(uda)
+            }
+            AssetSchema::Cfa => {
+                let cfa = AssetCFA::get_asset_details(
+                    self,
+                    &asset,
+                    transfers,
+                    asset_transfers,
+                    batch_transfers,
+                    colorings,
+                    txos,
+                    medias,
+                )?;
+                AssetType::AssetCFA(cfa)
+            }
+        };
+        Ok(Some(ret))
     }
 
     /// List the known RGB assets.
