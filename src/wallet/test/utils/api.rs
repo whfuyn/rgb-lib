@@ -89,22 +89,18 @@ pub(crate) fn _test_create_utxos(
 
 pub(crate) fn test_delete_transfers(
     wallet: &Wallet,
-    recipient_id: Option<&str>,
-    txid: Option<&str>,
+    batch_transfer_idx: Option<i32>,
     no_asset_only: bool,
 ) -> bool {
-    test_delete_transfers_result(wallet, recipient_id, txid, no_asset_only).unwrap()
+    test_delete_transfers_result(wallet, batch_transfer_idx, no_asset_only).unwrap()
 }
 
 pub(crate) fn test_delete_transfers_result(
     wallet: &Wallet,
-    recipient_id: Option<&str>,
-    txid: Option<&str>,
+    batch_transfer_idx: Option<i32>,
     no_asset_only: bool,
 ) -> Result<bool, Error> {
-    let recipient_id = recipient_id.map(|id| id.to_string());
-    let txid = txid.map(|id| id.to_string());
-    wallet.delete_transfers(recipient_id, txid, no_asset_only)
+    wallet.delete_transfers(batch_transfer_idx, no_asset_only)
 }
 
 pub(crate) fn test_drain_to_result(
@@ -149,24 +145,16 @@ pub(crate) fn test_drain_to_keep(wallet: &Wallet, online: &Online, address: &str
 }
 
 pub(crate) fn test_fail_transfers_all(wallet: &Wallet, online: &Online) -> bool {
-    wallet
-        .fail_transfers(online.clone(), None, None, false)
-        .unwrap()
+    wallet.fail_transfers(online.clone(), None, false).unwrap()
 }
 
-pub(crate) fn test_fail_transfers_blind(
+pub(crate) fn test_fail_transfers_single(
     wallet: &Wallet,
     online: &Online,
-    blinded_utxo: &str,
+    batch_transfer_idx: i32,
 ) -> bool {
     wallet
-        .fail_transfers(online.clone(), Some(blinded_utxo.to_string()), None, false)
-        .unwrap()
-}
-
-pub(crate) fn test_fail_transfers_txid(wallet: &Wallet, online: &Online, txid: &str) -> bool {
-    wallet
-        .fail_transfers(online.clone(), None, Some(txid.to_string()), false)
+        .fail_transfers(online.clone(), Some(batch_transfer_idx), false)
         .unwrap()
 }
 
@@ -371,19 +359,78 @@ pub(crate) fn test_refresh_asset(wallet: &Wallet, online: &Online, asset_id: &st
         .unwrap()
 }
 
+pub(crate) fn test_save_new_asset(
+    wallet: &Wallet,
+    online: &Online,
+    rcv_wallet: &Wallet,
+    asset_id: &String,
+    amount: u64,
+) {
+    let receive_data = test_witness_receive(rcv_wallet);
+    let recipient_map = HashMap::from([(
+        asset_id.clone(),
+        vec![Recipient {
+            amount,
+            recipient_data: RecipientData::WitnessData {
+                script_buf: ScriptBuf::from_hex(&receive_data.recipient_id).unwrap(),
+                amount_sat: 1000,
+                blinding: None,
+            },
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let txid = test_send(wallet, online, &recipient_map);
+    assert!(!txid.is_empty());
+
+    let txid_dir = wallet._transfers_dir().join(txid);
+    let asset_transfer_dir = txid_dir.join(asset_id);
+    let consignment_path = asset_transfer_dir.join(CONSIGNMENT_FILE);
+
+    let bindle = Bindle::<RgbTransfer>::load(consignment_path).unwrap();
+    let consignment: RgbTransfer = bindle.unbindle();
+    let mut contract = consignment.clone().into_contract();
+
+    contract.bundles = none!();
+    contract.terminals = none!();
+    let minimal_contract_validated =
+        match contract.validate(&mut rcv_wallet._blockchain_resolver().unwrap()) {
+            Ok(consignment) => consignment,
+            Err(consignment) => consignment,
+        };
+
+    let mut runtime = rcv_wallet._rgb_runtime().unwrap();
+    runtime
+        .import_contract(
+            minimal_contract_validated.clone(),
+            &mut rcv_wallet._blockchain_resolver().unwrap(),
+        )
+        .unwrap();
+    let schema_id = minimal_contract_validated.schema_id().to_string();
+    let asset_schema = AssetSchema::from_schema_id(schema_id).unwrap();
+    rcv_wallet
+        .save_new_asset(
+            &mut runtime,
+            &asset_schema,
+            minimal_contract_validated.contract_id(),
+        )
+        .unwrap();
+}
+
 pub(crate) fn test_send(
     wallet: &Wallet,
     online: &Online,
     recipient_map: &HashMap<String, Vec<Recipient>>,
 ) -> String {
-    test_send_result(wallet, online, recipient_map).unwrap()
+    test_send_result(wallet, online, recipient_map)
+        .unwrap()
+        .txid
 }
 
 pub(crate) fn test_send_result(
     wallet: &Wallet,
     online: &Online,
     recipient_map: &HashMap<String, Vec<Recipient>>,
-) -> Result<String, Error> {
+) -> Result<SendResult, Error> {
     wallet.send(
         online.clone(),
         recipient_map.clone(),
