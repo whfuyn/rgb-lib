@@ -19,8 +19,7 @@ use bdk::database::{
     AnyDatabase, BatchDatabase, ConfigurableDatabase as BdkConfigurableDatabase, MemoryDatabase,
 };
 use bdk::descriptor::IntoWalletDescriptor;
-use bdk::keys::bip39::{Language, Mnemonic};
-use bdk::keys::{DerivableKey, ExtendedKey};
+use bdk::keys::ExtendedKey;
 use bdk::wallet::AddressIndex;
 pub use bdk::BlockTime;
 use bdk::{FeeRate, KeychainKind, LocalUtxo, SignOptions, SyncOptions, Wallet as BdkWallet};
@@ -83,6 +82,8 @@ use crate::database::entities::batch_transfer::{
 };
 use crate::database::entities::coloring::{ActiveModel as DbColoringActMod, Model as DbColoring};
 use crate::database::entities::media::{ActiveModel as DbMediaActMod, Model as DbMedia};
+use crate::database::entities::pending_witness_outpoint::ActiveModel as DbPendingWitnessOutpointActMod;
+use crate::database::entities::pending_witness_script::ActiveModel as DbPendingWitnessScriptActMod;
 use crate::database::entities::token::{ActiveModel as DbTokenActMod, Model as DbToken};
 use crate::database::entities::token_media::{
     ActiveModel as DbTokenMediaActMod, Model as DbTokenMedia,
@@ -105,9 +106,9 @@ use crate::database::{
 };
 use crate::error::{Error, InternalError};
 use crate::utils::{
-    calculate_descriptor_from_xprv, calculate_descriptor_from_xpub, get_genesis_hash,
-    get_valid_txid_for_network, load_rgb_runtime, now, setup_logger, BitcoinNetwork, RgbRuntime,
-    LOG_FILE,
+    calculate_descriptor_from_xprv, calculate_descriptor_from_xpub,
+    derive_account_xprv_from_mnemonic, get_genesis_hash, get_valid_txid_for_network,
+    get_xpub_from_xprv, load_rgb_runtime, now, setup_logger, BitcoinNetwork, RgbRuntime, LOG_FILE,
 };
 
 #[cfg(test)]
@@ -636,6 +637,8 @@ pub struct ReceiveData {
     pub recipient_id: String,
     /// Expiration of the receive operation
     pub expiration_timestamp: Option<i64>,
+    /// Batch transfer idx
+    pub batch_transfer_idx: i32,
 }
 
 /// An RGB blinded UTXO, which is used to refer to an UTXO without revealing it.
@@ -654,6 +657,14 @@ impl BlindedUTXO {
         })?;
         Ok(BlindedUTXO { blinded_utxo })
     }
+}
+
+/// The result of a send operation
+pub struct SendResult {
+    /// ID of the transaction
+    pub txid: String,
+    /// Batch transfer idx
+    pub batch_transfer_idx: i32,
 }
 
 /// An RGB transport endpoint.
@@ -1061,6 +1072,8 @@ pub struct Transfer {
     pub idx: i32,
     /// ID of the asset
     pub asset_id: Option<String>,
+    /// ID of the batch transfer containing this transfer
+    pub batch_transfer_idx: i32,
     /// Timestamp of the transfer creation
     pub created_at: i64,
     /// Timestamp of the transfer last update
@@ -1094,6 +1107,7 @@ impl Transfer {
         Transfer {
             idx: x.idx,
             asset_id: td.asset_id,
+            batch_transfer_idx: td.batch_transfer_idx,
             created_at: td.created_at,
             updated_at: td.updated_at,
             status: td.status,
@@ -1225,7 +1239,7 @@ pub struct WalletData {
     pub database_type: DatabaseType,
     /// The max number of RGB allocations allowed per UTXO
     pub max_allocations_per_utxo: u32,
-    /// Wallet xPub
+    /// Wallet account-level xPub
     pub pubkey: String,
     /// Wallet mnemonic phrase
     pub mnemonic: Option<String>,
@@ -1301,25 +1315,13 @@ impl Wallet {
         let bdk_database =
             AnyDatabase::from_config(&bdk_config.into()).map_err(InternalError::from)?;
         let bdk_wallet = if let Some(mnemonic) = wdata.mnemonic {
-            let mnemonic = Mnemonic::parse_in(Language::English, mnemonic)?;
-            let xkey: ExtendedKey = mnemonic
-                .clone()
-                .into_extended_key()
-                .expect("a valid key should have been provided");
-            let xpub_from_mnemonic = &xkey.into_xpub(bdk_network, &Secp256k1::new());
-            if *xpub_from_mnemonic != xpub {
+            let account_xprv = derive_account_xprv_from_mnemonic(wdata.bitcoin_network, &mnemonic)?;
+            let account_xpub = get_xpub_from_xprv(&account_xprv);
+            if account_xpub != xpub {
                 return Err(Error::InvalidBitcoinKeys);
             }
-            let xkey: ExtendedKey = mnemonic
-                .into_extended_key()
-                .expect("a valid key should have been provided");
-            let xprv = xkey
-                .into_xprv(bdk_network)
-                .expect("should be possible to get an extended private key");
-            let descriptor =
-                calculate_descriptor_from_xprv(xprv, wdata.bitcoin_network, KEYCHAIN_RGB_OPRET);
-            let change_descriptor =
-                calculate_descriptor_from_xprv(xprv, wdata.bitcoin_network, vanilla_keychain);
+            let descriptor = calculate_descriptor_from_xprv(account_xprv, KEYCHAIN_RGB_OPRET)?;
+            let change_descriptor = calculate_descriptor_from_xprv(account_xprv, vanilla_keychain)?;
             BdkWallet::new(
                 &descriptor,
                 Some(&change_descriptor),
@@ -1328,10 +1330,8 @@ impl Wallet {
             )
             .map_err(InternalError::from)?
         } else {
-            let descriptor_pub =
-                calculate_descriptor_from_xpub(xpub, wdata.bitcoin_network, KEYCHAIN_RGB_OPRET)?;
-            let change_descriptor_pub =
-                calculate_descriptor_from_xpub(xpub, wdata.bitcoin_network, vanilla_keychain)?;
+            let descriptor_pub = calculate_descriptor_from_xpub(xpub, KEYCHAIN_RGB_OPRET)?;
+            let change_descriptor_pub = calculate_descriptor_from_xpub(xpub, vanilla_keychain)?;
             BdkWallet::new(
                 &descriptor_pub,
                 Some(&change_descriptor_pub),
@@ -1462,7 +1462,7 @@ impl Wallet {
             })
     }
 
-    fn _check_transport_endpoints(&self, transport_endpoints: &Vec<String>) -> Result<(), Error> {
+    fn _check_transport_endpoints(&self, transport_endpoints: &[String]) -> Result<(), Error> {
         if transport_endpoints.is_empty() {
             return Err(Error::InvalidTransportEndpoints {
                 details: s!("must provide at least a transport endpoint"),
@@ -1534,14 +1534,35 @@ impl Wallet {
             .bdk_wallet
             .list_unspent()
             .map_err(InternalError::from)?;
-        let new_utxos: Vec<DbTxoActMod> = bdk_utxos
+        let new_utxos: Vec<LocalUtxo> = bdk_utxos
             .into_iter()
             .filter(|u| u.keychain == KeychainKind::External)
             .filter(|u| !db_outpoints.contains(&u.outpoint.to_string()))
-            .map(DbTxoActMod::from)
             .collect();
+
+        let pending_witness_scripts: Vec<String> = self
+            .database
+            .iter_pending_witness_scripts()?
+            .into_iter()
+            .map(|s| s.script)
+            .collect();
+
         for new_utxo in new_utxos.iter().cloned() {
-            self.database.set_txo(new_utxo)?;
+            let new_db_utxo: DbTxoActMod = new_utxo.clone().into();
+            if !pending_witness_scripts.is_empty() {
+                let pending_witness_script = new_utxo.txout.script_pubkey.to_hex_string();
+                if pending_witness_scripts.contains(&pending_witness_script) {
+                    self.database
+                        .set_pending_witness_outpoint(DbPendingWitnessOutpointActMod {
+                            txid: new_db_utxo.txid.clone(),
+                            vout: new_db_utxo.vout.clone(),
+                            ..Default::default()
+                        })?;
+                    self.database
+                        .del_pending_witness_script(pending_witness_script)?;
+                }
+            }
+            self.database.set_txo(new_db_utxo)?;
         }
 
         Ok(())
@@ -1583,7 +1604,7 @@ impl Wallet {
             }
             let mut db_txo: DbTxoActMod = self
                 .database
-                .get_txo(Outpoint { txid, vout })?
+                .get_txo(&Outpoint { txid, vout })?
                 .expect("outpoint should be in the DB")
                 .into();
             db_txo.spent = ActiveValue::Set(true);
@@ -1630,7 +1651,7 @@ impl Wallet {
             .filter(|t| t.waiting_counterparty() && t.expiration.unwrap_or(now) < now)
             .collect();
         for transfer in expired_transfers.iter() {
-            let updated_batch_transfer = self._refresh_transfer(transfer, db_data, &vec![])?;
+            let updated_batch_transfer = self._refresh_transfer(transfer, db_data, &[])?;
             if updated_batch_transfer.is_none() {
                 let mut updated_batch_transfer: DbBatchTransferActMod = transfer.clone().into();
                 updated_batch_transfer.status = ActiveValue::Set(TransferStatus::Failed);
@@ -1775,7 +1796,7 @@ impl Wallet {
         beneficiary: Beneficiary,
         recipient_type: RecipientType,
         recipient_id: String,
-    ) -> Result<(String, Option<i64>, i32), Error> {
+    ) -> Result<(String, Option<i64>, i32, i32), Error> {
         debug!(self.logger, "Recipient ID: {recipient_id}");
         let (iface, contract_id) = if let Some(aid) = asset_id.clone() {
             let asset = self.database.check_asset_exists(aid.clone())?;
@@ -1880,7 +1901,12 @@ impl Wallet {
             )?;
         }
 
-        Ok((invoice.to_string(), expiry, asset_transfer_idx))
+        Ok((
+            invoice.to_string(),
+            expiry,
+            batch_transfer_idx,
+            asset_transfer_idx,
+        ))
     }
 
     /// Blind an UTXO to receive RGB assets and return the resulting [`ReceiveData`].
@@ -1946,16 +1972,17 @@ impl Wallet {
         let concealed_seal = seal.to_concealed_seal();
         let blinded_utxo = concealed_seal.to_string();
 
-        let (invoice, expiration_timestamp, asset_transfer_idx) = self._receive(
-            asset_id,
-            amount,
-            duration_seconds,
-            transport_endpoints,
-            min_confirmations,
-            concealed_seal.into(),
-            RecipientType::Blind,
-            blinded_utxo.clone(),
-        )?;
+        let (invoice, expiration_timestamp, batch_transfer_idx, asset_transfer_idx) = self
+            ._receive(
+                asset_id,
+                amount,
+                duration_seconds,
+                transport_endpoints,
+                min_confirmations,
+                concealed_seal.into(),
+                RecipientType::Blind,
+                blinded_utxo.clone(),
+            )?;
 
         let mut runtime = self._rgb_runtime()?;
         runtime.store_seal_secret(seal)?;
@@ -1976,6 +2003,7 @@ impl Wallet {
             invoice,
             recipient_id: blinded_utxo,
             expiration_timestamp,
+            batch_transfer_idx,
         })
     }
 
@@ -2020,7 +2048,7 @@ impl Wallet {
         let address = Address::from_str(&address_str).unwrap().assume_checked();
         let script_buf_str = address.script_pubkey().to_hex_string();
 
-        let (invoice, expiration_timestamp, _) = self._receive(
+        let (invoice, expiration_timestamp, batch_transfer_idx, _) = self._receive(
             asset_id,
             amount,
             duration_seconds,
@@ -2031,6 +2059,12 @@ impl Wallet {
             script_buf_str.clone(),
         )?;
 
+        self.database
+            .set_pending_witness_script(DbPendingWitnessScriptActMod {
+                script: ActiveValue::Set(script_buf_str.clone()),
+                ..Default::default()
+            })?;
+
         self.update_backup_info(false)?;
 
         info!(self.logger, "Witness receive completed");
@@ -2038,6 +2072,7 @@ impl Wallet {
             invoice,
             recipient_id: script_buf_str,
             expiration_timestamp,
+            batch_transfer_idx,
         })
     }
 
@@ -2059,7 +2094,7 @@ impl Wallet {
         unsigned_psbt: String,
         sign_options: Option<SignOptions>,
     ) -> Result<String, Error> {
-        let mut psbt = BdkPsbt::from_str(&unsigned_psbt).map_err(InternalError::from)?;
+        let mut psbt = BdkPsbt::from_str(&unsigned_psbt)?;
         self._sign_psbt(&mut psbt, sign_options)?;
         Ok(psbt.to_string())
     }
@@ -2254,78 +2289,48 @@ impl Wallet {
     /// Delete eligible transfers from the database and return true if any transfer has been
     /// deleted.
     ///
-    /// An optional `recipient_id` can be provided to operate on a single transfer.
-    /// An optional `txid` can be provided to operate on a batch transfer.
+    /// An optional `batch_transfer_idx` can be provided to operate on a single batch transfer.
     ///
-    /// If both a `recipient_id` and a `txid` are provided, they need to belong to the same batch
-    /// transfer or an error is returned.
+    /// If a `batch_transfer_idx` is provided and `no_asset_only` is true, transfers with an
+    /// associated asset ID will not be deleted and instead return an error.
     ///
-    /// If at least one of `recipient_id` or `txid` are provided and `no_asset_only` is true,
-    /// transfers with an associated asset ID will not be deleted and instead return an error.
-    ///
-    /// If neither `recipient_id` nor `txid` are provided, all failed transfers will be deleted,
-    /// unless `no_asset_only` is true, in which case transfers with an associated asset ID will be
-    /// skipped.
+    /// If no `batch_transfer_idx` is provided, all failed transfers will be deleted, and if
+    /// `no_asset_only` is true transfers with an associated asset ID will be skipped.
     ///
     /// Eligible transfers are the ones in status [`TransferStatus::Failed`].
     pub fn delete_transfers(
         &self,
-        recipient_id: Option<String>,
-        txid: Option<String>,
+        batch_transfer_idx: Option<i32>,
         no_asset_only: bool,
     ) -> Result<bool, Error> {
         info!(
             self.logger,
-            "Deleting transfer with recipient ID {:?} and TXID {:?}...", recipient_id, txid
+            "Deleting batch transfer with idx {:?}...", batch_transfer_idx
         );
 
         let db_data = self.database.get_db_data(false)?;
         let mut transfers_changed = false;
 
-        if recipient_id.is_some() || txid.is_some() {
-            let (batch_transfer, asset_transfers) = if let Some(recipient_id) = recipient_id {
-                let db_transfer = &self
-                    .database
-                    .get_transfer_or_fail(recipient_id, &db_data.transfers)?;
-                let (_, batch_transfer) = db_transfer
-                    .related_transfers(&db_data.asset_transfers, &db_data.batch_transfers)?;
-                let asset_transfers =
-                    batch_transfer.get_asset_transfers(&db_data.asset_transfers)?;
-                let asset_transfer_ids: Vec<i32> = asset_transfers.iter().map(|t| t.idx).collect();
-                if (db_data
-                    .transfers
-                    .into_iter()
-                    .filter(|t| asset_transfer_ids.contains(&t.asset_transfer_idx))
-                    .count()
-                    > 1
-                    || txid.is_some())
-                    && txid != batch_transfer.txid
-                {
-                    return Err(Error::CannotDeleteTransfer);
-                }
-                (batch_transfer, asset_transfers)
-            } else {
-                let batch_transfer = self
-                    .database
-                    .get_batch_transfer_or_fail(txid.expect("TXID"), &db_data.batch_transfers)?;
-                let asset_transfers =
-                    batch_transfer.get_asset_transfers(&db_data.asset_transfers)?;
-                (batch_transfer, asset_transfers)
-            };
+        if let Some(batch_transfer_idx) = batch_transfer_idx {
+            let batch_transfer = &self
+                .database
+                .get_batch_transfer_or_fail(batch_transfer_idx, &db_data.batch_transfers)?;
 
             if !batch_transfer.failed() {
-                return Err(Error::CannotDeleteTransfer);
+                return Err(Error::CannotDeleteBatchTransfer);
             }
+
+            let asset_transfers = batch_transfer.get_asset_transfers(&db_data.asset_transfers)?;
 
             if no_asset_only {
                 let connected_assets = asset_transfers.iter().any(|t| t.asset_id.is_some());
                 if connected_assets {
-                    return Err(Error::CannotDeleteTransfer);
+                    return Err(Error::CannotDeleteBatchTransfer);
                 }
             }
 
             transfers_changed = true;
-            self._delete_batch_transfer(&batch_transfer, &asset_transfers)?
+            self._delete_batch_transfer(batch_transfer, &asset_transfers)?
         } else {
             // delete all failed transfers
             let mut batch_transfers: Vec<DbBatchTransfer> = db_data
@@ -2493,12 +2498,12 @@ impl Wallet {
         throw_err: bool,
         db_data: &mut DbData,
     ) -> Result<(), Error> {
-        let updated_batch_transfer = self._refresh_transfer(batch_transfer, db_data, &vec![])?;
+        let updated_batch_transfer = self._refresh_transfer(batch_transfer, db_data, &[])?;
         // fail transfer if the status didn't change after a refresh
         if updated_batch_transfer.is_none() {
             self._fail_batch_transfer(batch_transfer)?;
         } else if throw_err {
-            return Err(Error::CannotFailTransfer);
+            return Err(Error::CannotFailBatchTransfer);
         }
 
         Ok(())
@@ -2507,16 +2512,12 @@ impl Wallet {
     /// Set the status for eligible transfers to [`TransferStatus::Failed`] and return true if any
     /// transfer has changed.
     ///
-    /// An optional `recipient_id` can be provided to operate on a single transfer.
-    /// An optional `txid` can be provided to operate on a batch transfer.
+    /// An optional `batch_transfer_idx` can be provided to operate on a single batch transfer.
     ///
-    /// If both a `recipient_id` and a `txid` are provided, they need to belong to the same batch
-    /// transfer or an error is returned.
+    /// If a `batch_transfer_idx` is provided and `no_asset_only` is true, transfers with an
+    /// associated asset ID will not be failed and instead return an error.
     ///
-    /// If at least one of `recipient_id` or `txid` are provided and `no_asset_only` is true,
-    /// transfers with an associated asset ID will not be failed and instead return an error.
-    ///
-    /// If neither `recipient_id` nor `txid` are provided, only expired transfers will be failed,
+    /// If no `batch_transfer_idx` is provided, only expired transfers will be failed,
     /// and if `no_asset_only` is true transfers with an associated asset ID will be skipped.
     ///
     /// Transfers are eligible if they remain in status [`TransferStatus::WaitingCounterparty`]
@@ -2524,49 +2525,25 @@ impl Wallet {
     pub fn fail_transfers(
         &self,
         online: Online,
-        recipient_id: Option<String>,
-        txid: Option<String>,
+        batch_transfer_idx: Option<i32>,
         no_asset_only: bool,
     ) -> Result<bool, Error> {
         info!(
             self.logger,
-            "Failing transfer with recipient ID {:?} and TXID {:?}...", recipient_id, txid
+            "Failing batch transfer with idx {:?}...", batch_transfer_idx
         );
         self._check_online(online)?;
 
         let mut db_data = self.database.get_db_data(false)?;
         let mut transfers_changed = false;
 
-        if recipient_id.is_some() || txid.is_some() {
-            let batch_transfer = if let Some(recipient_id) = recipient_id {
-                let db_transfer = &self
-                    .database
-                    .get_transfer_or_fail(recipient_id, &db_data.transfers)?;
-                let (_, batch_transfer) = db_transfer
-                    .related_transfers(&db_data.asset_transfers, &db_data.batch_transfers)?;
-                let asset_transfers =
-                    batch_transfer.get_asset_transfers(&db_data.asset_transfers)?;
-                let asset_transfer_ids: Vec<i32> = asset_transfers.iter().map(|t| t.idx).collect();
-                if (db_data
-                    .transfers
-                    .clone()
-                    .into_iter()
-                    .filter(|t| asset_transfer_ids.contains(&t.asset_transfer_idx))
-                    .count()
-                    > 1
-                    || txid.is_some())
-                    && txid != batch_transfer.txid
-                {
-                    return Err(Error::CannotFailTransfer);
-                }
-                batch_transfer
-            } else {
-                self.database
-                    .get_batch_transfer_or_fail(txid.expect("TXID"), &db_data.batch_transfers)?
-            };
+        if let Some(batch_transfer_idx) = batch_transfer_idx {
+            let batch_transfer = &self
+                .database
+                .get_batch_transfer_or_fail(batch_transfer_idx, &db_data.batch_transfers)?;
 
             if !batch_transfer.waiting_counterparty() {
-                return Err(Error::CannotFailTransfer);
+                return Err(Error::CannotFailBatchTransfer);
             }
 
             if no_asset_only {
@@ -2574,12 +2551,12 @@ impl Wallet {
                     batch_transfer.get_asset_transfers(&db_data.asset_transfers)?;
                 let connected_assets = asset_transfers.iter().any(|t| t.asset_id.is_some());
                 if connected_assets {
-                    return Err(Error::CannotFailTransfer);
+                    return Err(Error::CannotFailBatchTransfer);
                 }
             }
 
             transfers_changed = true;
-            self._try_fail_batch_transfer(&batch_transfer, true, &mut db_data)?
+            self._try_fail_batch_transfer(batch_transfer, true, &mut db_data)?
         } else {
             // fail all transfers in status WaitingCounterparty
             let now = now().unix_timestamp();
@@ -2715,7 +2692,9 @@ impl Wallet {
     ) -> Result<ContractIface, Error> {
         let iface_name = AssetIface::from(*asset_schema).to_typename();
         let iface = runtime.iface_by_name(&iface_name)?.clone();
-        Ok(runtime.contract_iface(contract_id, iface.iface_id())?)
+        runtime
+            .contract_iface(contract_id, iface.iface_id())
+            .map_err(|_| Error::AssetIfaceMismatch)
     }
 
     fn _get_asset_timestamp(&self, contract: &ContractIface) -> Result<i64, Error> {
@@ -3175,7 +3154,7 @@ impl Wallet {
         Ok(db_asset.try_into_model().unwrap())
     }
 
-    fn _get_total_issue_amount(&self, amounts: &Vec<u64>) -> Result<u64, Error> {
+    fn _get_total_issue_amount(&self, amounts: &[u64]) -> Result<u64, Error> {
         if amounts.is_empty() {
             return Err(Error::NoIssuanceAmounts);
         }
@@ -4279,7 +4258,7 @@ impl Wallet {
     fn _fail_batch_transfer_if_no_endpoints(
         &self,
         batch_transfer: &DbBatchTransfer,
-        transfer_transport_endpoints_data: &Vec<(DbTransferTransportEndpoint, DbTransportEndpoint)>,
+        transfer_transport_endpoints_data: &[(DbTransferTransportEndpoint, DbTransportEndpoint)],
     ) -> Result<bool, Error> {
         if transfer_transport_endpoints_data.is_empty() {
             self._fail_batch_transfer(batch_transfer)?;
@@ -4905,12 +4884,13 @@ impl Wallet {
 
             if transfer.recipient_type == Some(RecipientType::Witness) {
                 self._sync_db_txos()?;
+                let outpoint = Outpoint {
+                    txid,
+                    vout: transfer.vout.unwrap(),
+                };
                 let utxo = self
                     .database
-                    .get_txo(Outpoint {
-                        txid,
-                        vout: transfer.vout.unwrap(),
-                    })?
+                    .get_txo(&outpoint)?
                     .expect("outpoint should be in the DB");
 
                 let db_coloring = DbColoringActMod {
@@ -4921,6 +4901,8 @@ impl Wallet {
                     ..Default::default()
                 };
                 self.database.set_coloring(db_coloring)?;
+
+                self.database.del_pending_witness_outpoint(outpoint)?;
             }
 
             // accept consignment
@@ -4963,7 +4945,7 @@ impl Wallet {
         &self,
         transfer: &DbBatchTransfer,
         db_data: &mut DbData,
-        filter: &Vec<RefreshFilter>,
+        filter: &[RefreshFilter],
     ) -> Result<Option<DbBatchTransfer>, Error> {
         debug!(self.logger, "Refreshing transfer: {:?}", transfer);
         let incoming = transfer.incoming(&db_data.asset_transfers, &db_data.transfers)?;
@@ -5530,7 +5512,7 @@ impl Wallet {
         change_utxo_idx: Option<i32>,
         status: TransferStatus,
         min_confirmations: u8,
-    ) -> Result<(), Error> {
+    ) -> Result<i32, Error> {
         let created_at = now().unix_timestamp();
         let expiration = Some(created_at + DURATION_SEND_TRANSFER);
 
@@ -5610,11 +5592,21 @@ impl Wallet {
             self.database.set_coloring(db_coloring)?;
         }
 
-        Ok(())
+        Ok(batch_transfer_idx)
     }
 
-    fn _get_input_unspents(&self, unspents: &[LocalUnspent]) -> Vec<LocalUnspent> {
+    fn _get_input_unspents(&self, unspents: &[LocalUnspent]) -> Result<Vec<LocalUnspent>, Error> {
+        let pending_witness_outpoints: Vec<Outpoint> = self
+            .database
+            .iter_pending_witness_outpoints()?
+            .iter()
+            .map(|o| o.outpoint())
+            .collect();
         let mut input_unspents = unspents.to_vec();
+        // consider the following UTXOs unspendable:
+        // - incoming and pending
+        // - outgoing and in waiting counterparty status
+        // - pending incoming witness
         input_unspents.retain(|u| {
             !((u.rgb_allocations
                 .iter()
@@ -5622,9 +5614,11 @@ impl Wallet {
                 || (u
                     .rgb_allocations
                     .iter()
-                    .any(|a| !a.incoming && a.status.waiting_counterparty())))
+                    .any(|a| !a.incoming && a.status.waiting_counterparty()))
+                || (!pending_witness_outpoints.is_empty()
+                    && pending_witness_outpoints.contains(&u.outpoint())))
         });
-        input_unspents
+        Ok(input_unspents)
     }
 
     /// Send RGB assets.
@@ -5640,7 +5634,7 @@ impl Wallet {
         donation: bool,
         fee_rate: f32,
         min_confirmations: u8,
-    ) -> Result<String, Error> {
+    ) -> Result<SendResult, Error> {
         info!(self.logger, "Sending to: {:?}...", recipient_map);
         self._check_xprv()?;
 
@@ -5728,7 +5722,7 @@ impl Wallet {
         #[cfg(test)]
         let input_unspents = test::mock_input_unspents(self, &unspents);
         #[cfg(not(test))]
-        let input_unspents = self._get_input_unspents(&unspents);
+        let input_unspents = self._get_input_unspents(&unspents)?;
 
         let mut runtime = self._rgb_runtime()?;
         let mut witness_recipients: Vec<(ScriptBuf, u64)> = vec![];
@@ -5878,8 +5872,8 @@ impl Wallet {
     ///
     /// This doesn't require the wallet to have private keys.
     ///
-    /// Returns the TXID of the signed PSBT that's been saved and optionally broadcast.
-    pub fn send_end(&self, online: Online, signed_psbt: String) -> Result<String, Error> {
+    /// Returns a [`SendResult`].
+    pub fn send_end(&self, online: Online, signed_psbt: String) -> Result<SendResult, Error> {
         info!(self.logger, "Sending (end)...");
         self._check_online(online)?;
 
@@ -5953,7 +5947,7 @@ impl Wallet {
         } else {
             TransferStatus::WaitingCounterparty
         };
-        self._save_transfers(
+        let batch_transfer_idx = self._save_transfers(
             txid.clone(),
             transfer_info_map,
             blank_allocations,
@@ -5965,7 +5959,10 @@ impl Wallet {
         self.update_backup_info(false)?;
 
         info!(self.logger, "Send (end) completed");
-        Ok(txid)
+        Ok(SendResult {
+            txid,
+            batch_transfer_idx,
+        })
     }
 
     /// Send bitcoins using the vanilla wallet.

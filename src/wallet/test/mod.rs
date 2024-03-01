@@ -41,6 +41,7 @@ const RESTORE_DIR_PARTS: [&str; 3] = ["tests", "tmp", "restored"];
 const MAX_ALLOCATIONS_PER_UTXO: u32 = 5;
 const MIN_CONFIRMATIONS: u8 = 1;
 const FAKE_TXID: &str = "e5a3e577309df31bd606f48049049d2e1e02b048206ba232944fcc053a176ccb:0";
+const UNKNOWN_IDX: i32 = 9999;
 
 static INIT: Once = Once::new();
 
@@ -161,7 +162,7 @@ lazy_static! {
 pub fn mock_input_unspents(wallet: &Wallet, unspents: &[LocalUnspent]) -> Vec<LocalUnspent> {
     let mut mock_input_unspents = MOCK_INPUT_UNSPENTS.lock().unwrap();
     if mock_input_unspents.is_empty() {
-        wallet._get_input_unspents(unspents)
+        wallet._get_input_unspents(unspents).unwrap()
     } else {
         mock_input_unspents.drain(..).collect()
     }
@@ -193,6 +194,8 @@ mod get_address;
 mod get_asset_balance;
 mod get_asset_metadata;
 mod get_btc_balance;
+mod get_wallet_data;
+mod get_wallet_dir;
 mod go_online;
 mod issue_asset_cfa;
 mod issue_asset_nia;
@@ -204,6 +207,8 @@ mod list_unspents;
 mod list_unspents_vanilla;
 mod new;
 mod refresh;
+mod save_new_asset;
 mod send;
 mod send_btc;
+mod sign_psbt;
 mod witness_receive;

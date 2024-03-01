@@ -7,22 +7,20 @@ pub struct Entity;
 
 impl EntityName for Entity {
     fn table_name(&self) -> &str {
-        "media"
+        "pending_witness_script"
     }
 }
 
 #[derive(Clone, Debug, PartialEq, DeriveModel, DeriveActiveModel, Eq)]
 pub struct Model {
     pub idx: i32,
-    pub digest: String,
-    pub mime: String,
+    pub script: String,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveColumn)]
 pub enum Column {
     Idx,
-    Digest,
-    Mime,
+    Script,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DerivePrimaryKey)]
@@ -38,40 +36,21 @@ impl PrimaryKeyTrait for PrimaryKey {
 }
 
 #[derive(Copy, Clone, Debug, EnumIter)]
-pub enum Relation {
-    Asset,
-    TokenMedia,
-}
+pub enum Relation {}
 
 impl ColumnTrait for Column {
     type EntityName = Entity;
     fn def(&self) -> ColumnDef {
         match self {
             Self::Idx => ColumnType::Integer.def(),
-            Self::Digest => ColumnType::String(None).def().unique(),
-            Self::Mime => ColumnType::String(None).def(),
+            Self::Script => ColumnType::String(None).def().unique(),
         }
     }
 }
 
 impl RelationTrait for Relation {
     fn def(&self) -> RelationDef {
-        match self {
-            Self::Asset => Entity::has_many(super::asset::Entity).into(),
-            Self::TokenMedia => Entity::has_many(super::token_media::Entity).into(),
-        }
-    }
-}
-
-impl Related<super::asset::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::Asset.def()
-    }
-}
-
-impl Related<super::token_media::Entity> for Entity {
-    fn to() -> RelationDef {
-        Relation::TokenMedia.def()
+        panic!("No RelationDef")
     }
 }
 
