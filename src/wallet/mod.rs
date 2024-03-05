@@ -101,7 +101,7 @@ use crate::database::enums::{
 };
 use crate::database::{
     DbData, LocalRecipient, LocalRgbAllocation, LocalTransportEndpoint, LocalUnspent,
-    RgbLibDatabase, TransferData,
+    RgbLibDatabase, TransferData, UtxoAllocation,
 };
 use crate::error::{Error, InternalError};
 use crate::utils::{
@@ -2633,6 +2633,15 @@ impl Wallet {
 
         info!(self.logger, "Get address completed");
         Ok(address)
+    }
+
+    /// Return a Vec of [`UtxoAllocation`] for the RGB asset with the provided ID.
+    pub fn get_asset_utxos(&self, asset_id: &str) -> Result<Vec<UtxoAllocation>, Error> {
+        info!(self.logger, "Getting Utxos for asset '{}'...", asset_id);
+        self.database.check_asset_exists(asset_id.to_string())?;
+        let utxo_allocs = self.database.get_asset_utxos(asset_id);
+        info!(self.logger, "Get asset balance completed");
+        utxo_allocs
     }
 
     /// Return the [`Balance`] for the RGB asset with the provided ID.
