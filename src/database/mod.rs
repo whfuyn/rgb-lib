@@ -267,6 +267,14 @@ impl LocalRgbAllocation {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct UtxoAllocation {
+    pub txid: String,
+    pub vout: u32,
+
+    pub settled: u64,
+}
+
 #[derive(Debug)]
 pub(crate) struct TransferData {
     pub(crate) asset_id: Option<String>,
@@ -664,6 +672,40 @@ impl RgbLibDatabase {
         Ok(txos.into_iter().filter(|t| !t.spent).collect())
     }
 
+    pub(crate) fn get_asset_utxos(&self, asset_id: &str) -> Result<Vec<UtxoAllocation>, Error> {
+        let asset_transfers = self.iter_asset_transfers()?;
+        let batch_transfers = self.iter_batch_transfers()?;
+        let colorings = self.iter_colorings()?;
+        let txos = self.iter_txos()?;
+
+        let utxo_allocs = self
+            .get_rgb_allocations(
+                txos,
+                Some(colorings),
+                Some(batch_transfers),
+                Some(asset_transfers),
+            )?
+            .into_iter()
+            .filter_map(|mut u| {
+                // All related utxos and its related rgb allocations.
+                u.rgb_allocations.retain(|a| {
+                    a.asset_id.as_deref() == Some(asset_id) && !a.txo_spent && a.settled()
+                });
+                (!u.rgb_allocations.is_empty()).then_some(u)
+            })
+            .map(|u| {
+                let settled = u.rgb_allocations.iter().map(|a| a.amount).sum();
+                UtxoAllocation {
+                    txid: u.utxo.txid,
+                    vout: u.utxo.vout,
+                    settled,
+                }
+            })
+            .collect::<Vec<_>>();
+
+        Ok(utxo_allocs)
+    }
+
     pub(crate) fn get_asset_balance(
         &self,
         asset_id: String,
@@ -770,8 +812,6 @@ impl RgbLibDatabase {
                             .iter()
                             .any(|a| !a.incoming && a.status.waiting_confirmations()))
             })
-            .collect::<Vec<LocalUnspent>>()
-            .iter()
             .map(|u| {
                 u.rgb_allocations
                     .iter()
