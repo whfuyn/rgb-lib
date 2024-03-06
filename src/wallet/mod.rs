@@ -620,7 +620,7 @@ pub struct Balance {
 /// balances.
 /// The spendable balances include the settled balance and also the untrusted and trusted pending
 /// balances.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Deserialize, Serialize)]
 pub struct BtcBalance {
     /// Funds that will never hold RGB assets
     pub vanilla: Balance,
@@ -629,7 +629,7 @@ pub struct BtcBalance {
 }
 
 /// Data to receive an RGB transfer.
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ReceiveData {
     /// Invoice string
     pub invoice: String,
@@ -642,7 +642,7 @@ pub struct ReceiveData {
 }
 
 /// An RGB blinded UTXO, which is used to refer to an UTXO without revealing it.
-#[derive(Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BlindedUTXO {
     /// Blinded UTXO in string form
     pub blinded_utxo: String,
@@ -660,6 +660,7 @@ impl BlindedUTXO {
 }
 
 /// The result of a send operation
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct SendResult {
     /// ID of the transaction
     pub txid: String,
@@ -668,7 +669,7 @@ pub struct SendResult {
 }
 
 /// An RGB transport endpoint.
-#[derive(Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TransportEndpoint {
     /// Endpoint address
     pub endpoint: String,
@@ -705,14 +706,21 @@ impl TryFrom<RgbTransport> for TransportEndpoint {
 }
 
 /// Supported database types.
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub enum DatabaseType {
     /// A SQLite database
     Sqlite,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
+struct BtcChange {
+    vout: u32,
+    amount: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
 struct InfoBatchTransfer {
+    btc_change: Option<BtcChange>,
     change_utxo_idx: Option<i32>,
     blank_allocations: HashMap<String, u64>,
     donation: bool,
@@ -727,7 +735,7 @@ struct InfoAssetTransfer {
 }
 
 /// An RGB invoice.
-#[derive(Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Invoice {
     /// The RGB invoice string
     invoice_string: String,
@@ -1203,6 +1211,8 @@ pub struct Utxo {
     pub btc_amount: u64,
     /// Defines if the UTXO can have RGB allocations
     pub colorable: bool,
+    /// Defines if the UTXO already exists (TX that creates it has been broadcasted)
+    pub exists: bool,
 }
 
 impl From<DbTxo> for Utxo {
@@ -1214,6 +1224,7 @@ impl From<DbTxo> for Utxo {
                 .parse::<u64>()
                 .expect("DB should contain a valid u64 value"),
             colorable: true,
+            exists: x.exists,
         }
     }
 }
@@ -1224,12 +1235,13 @@ impl From<LocalUtxo> for Utxo {
             outpoint: Outpoint::from(x.outpoint),
             btc_amount: x.txout.value,
             colorable: false,
+            exists: true,
         }
     }
 }
 
 /// Data that defines a [`Wallet`].
-#[derive(Clone, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct WalletData {
     /// Directory where the wallet directory is stored
     pub data_dir: String,
@@ -1274,17 +1286,17 @@ impl Wallet {
         let bdk_network = BdkNetwork::from(wdata.bitcoin_network);
         let xpub = extended_key.into_xpub(bdk_network, &Secp256k1::new());
         let fingerprint = xpub.fingerprint().to_string();
-        let absolute_data_dir = fs::canonicalize(wdata.data_dir)?;
-        let data_dir_path = Path::new(&absolute_data_dir);
-        let wallet_dir = data_dir_path.join(fingerprint);
+        let data_dir_path = Path::new(&wdata.data_dir);
         if !data_dir_path.exists() {
-            return Err(Error::InexistentDataDir)?;
+            return Err(Error::InexistentDataDir);
         }
+        let data_dir_path = fs::canonicalize(data_dir_path)?;
+        let wallet_dir = data_dir_path.join(fingerprint);
         if !wallet_dir.exists() {
-            fs::create_dir(wallet_dir.clone())?;
+            fs::create_dir(&wallet_dir)?;
             fs::create_dir(wallet_dir.join(MEDIA_DIR))?;
         }
-        let logger = setup_logger(wallet_dir.clone(), None)?;
+        let logger = setup_logger(&wallet_dir, None)?;
         info!(logger.clone(), "New wallet in '{:?}'", wallet_dir);
         let panic_logger = logger.clone();
         let prev_hook = panic::take_hook();
@@ -1484,7 +1496,8 @@ impl Wallet {
             return Err(Error::InvalidFeeRate {
                 details: format!("value under minimum {MIN_FEE_RATE}"),
             });
-        } else if fee_rate > MAX_FEE_RATE {
+        }
+        if fee_rate > MAX_FEE_RATE {
             return Err(Error::InvalidFeeRate {
                 details: format!("value above maximum {MAX_FEE_RATE}"),
             });
@@ -1523,9 +1536,10 @@ impl Wallet {
         debug!(self.logger, "Syncing TXOs...");
         self._sync_wallet_with_blockchain(&self.bdk_wallet, bdk_blockchain)?;
 
-        let db_outpoints: Vec<String> = self
-            .database
-            .iter_txos()?
+        let db_txos = self.database.iter_txos()?;
+
+        let db_outpoints: Vec<String> = db_txos
+            .clone()
             .into_iter()
             .filter(|t| !t.spent)
             .map(|u| u.outpoint().to_string())
@@ -1534,9 +1548,14 @@ impl Wallet {
             .bdk_wallet
             .list_unspent()
             .map_err(InternalError::from)?;
-        let new_utxos: Vec<LocalUtxo> = bdk_utxos
+        let external_bdk_utxos: Vec<LocalUtxo> = bdk_utxos
             .into_iter()
             .filter(|u| u.keychain == KeychainKind::External)
+            .collect();
+
+        let new_utxos: Vec<LocalUtxo> = external_bdk_utxos
+            .clone()
+            .into_iter()
             .filter(|u| !db_outpoints.contains(&u.outpoint.to_string()))
             .collect();
 
@@ -1563,6 +1582,21 @@ impl Wallet {
                 }
             }
             self.database.set_txo(new_db_utxo)?;
+        }
+
+        if external_bdk_utxos.len() - new_utxos.len() > 0 {
+            let inexistent_db_utxos: Vec<DbTxo> =
+                db_txos.into_iter().filter(|t| !t.exists).collect();
+            for inexistent_db_utxo in inexistent_db_utxos {
+                if external_bdk_utxos
+                    .iter()
+                    .any(|u| Outpoint::from(u.outpoint) == inexistent_db_utxo.outpoint())
+                {
+                    let mut db_txo: DbTxoActMod = inexistent_db_utxo.into();
+                    db_txo.exists = ActiveValue::Set(true);
+                    self.database.update_txo(db_txo)?;
+                }
+            }
         }
 
         Ok(())
@@ -1675,6 +1709,7 @@ impl Wallet {
         let max_allocs = max_allocations.unwrap_or(self.max_allocations_per_utxo - 1);
         Ok(mut_unspents
             .iter()
+            .filter(|u| u.utxo.exists)
             .filter(|u| !exclude_utxos.contains(&u.utxo.outpoint()))
             .filter(|u| {
                 (u.rgb_allocations.len() as u32) <= max_allocs
@@ -2189,9 +2224,8 @@ impl Wallet {
                 .len() as u8;
             if allocatable >= utxos_to_create {
                 return Err(Error::AllocationsAlreadyAvailable);
-            } else {
-                utxos_to_create -= allocatable
             }
+            utxos_to_create -= allocatable
         }
         debug!(self.logger, "Will try to create {} UTXOs", utxos_to_create);
 
@@ -2279,9 +2313,23 @@ impl Wallet {
         &self,
         batch_transfer: &DbBatchTransfer,
         asset_transfers: &Vec<DbAssetTransfer>,
+        colorings: &[DbColoring],
+        txos: &[DbTxo],
     ) -> Result<(), Error> {
+        let mut txos_to_delete = HashSet::new();
         for asset_transfer in asset_transfers {
             self.database.del_coloring(asset_transfer.idx)?;
+            colorings
+                .iter()
+                .filter(|c| c.asset_transfer_idx == asset_transfer.idx)
+                .for_each(|c| {
+                    if let Some(txo) = txos.iter().find(|t| !t.exists && t.idx == c.txo_idx) {
+                        txos_to_delete.insert(txo.idx);
+                    }
+                });
+        }
+        for txo in txos_to_delete {
+            self.database.del_txo(txo)?;
         }
         Ok(self.database.del_batch_transfer(batch_transfer)?)
     }
@@ -2330,7 +2378,12 @@ impl Wallet {
             }
 
             transfers_changed = true;
-            self._delete_batch_transfer(batch_transfer, &asset_transfers)?
+            self._delete_batch_transfer(
+                batch_transfer,
+                &asset_transfers,
+                &db_data.colorings,
+                &db_data.txos,
+            )?
         } else {
             // delete all failed transfers
             let mut batch_transfers: Vec<DbBatchTransfer> = db_data
@@ -2349,7 +2402,12 @@ impl Wallet {
                     }
                 }
                 transfers_changed = true;
-                self._delete_batch_transfer(batch_transfer, &asset_transfers)?
+                self._delete_batch_transfer(
+                    batch_transfer,
+                    &asset_transfers,
+                    &db_data.colorings,
+                    &db_data.txos,
+                )?
             }
         }
 
@@ -2402,7 +2460,8 @@ impl Wallet {
     /// `fee_rate` (in sat/vB).
     ///
     /// <div class="warning">Warning: setting <code>destroy_assets</code> to true is dangerous,
-    /// only do this if you know what you're doing!</div>
+    /// only do this if you know what you're doing! After destroying assets the wallet's RGB state
+    /// could be compromised and therefore the wallet should not be used anymore.</div>
     ///
     /// Signing of the returned PSBT needs to be carried out separately. The signed PSBT then needs
     /// to be fed to the [`drain_to_end`](Wallet::drain_to_end) function.
@@ -2927,7 +2986,7 @@ impl Wallet {
             .database
             .iter_txos()?
             .into_iter()
-            .filter(|t| !t.spent)
+            .filter(|t| !t.spent && t.exists)
             .map(|u| u.outpoint().to_string())
             .collect();
         let db_utxos: HashSet<String> = HashSet::from_iter(db_utxos);
@@ -4854,9 +4913,8 @@ impl Wallet {
                 {
                     debug!(self.logger, "Cannot find transaction");
                     return Ok(None);
-                } else {
-                    Err(e)
                 }
+                Err(e)
             }
         }?;
         debug!(
@@ -5108,7 +5166,7 @@ impl Wallet {
         input_outpoints: Vec<BdkOutPoint>,
         witness_recipients: &Vec<(ScriptBuf, u64)>,
         fee_rate: f32,
-    ) -> Result<BdkPsbt, Error> {
+    ) -> Result<(BdkPsbt, Option<BtcChange>), Error> {
         let mut builder = self.bdk_wallet.build_tx();
         builder
             .add_utxos(&input_outpoints)
@@ -5119,19 +5177,28 @@ impl Wallet {
         for (script_buf, amount_sat) in witness_recipients {
             builder.add_recipient(script_buf.clone(), *amount_sat);
         }
-        builder
-            .drain_to(self._get_new_address().script_pubkey())
-            .add_data(&[1]);
+        let change_addr = self._get_new_address().script_pubkey();
+        builder.drain_to(change_addr.clone()).add_data(&[1]);
 
-        Ok(builder
-            .finish()
-            .map_err(|e| match e {
-                bdk::Error::InsufficientFunds { needed, available } => {
-                    Error::InsufficientBitcoins { needed, available }
-                }
-                _ => Error::from(InternalError::from(e)),
-            })?
-            .0)
+        let (psbt, _) = builder.finish().map_err(|e| match e {
+            bdk::Error::InsufficientFunds { needed, available } => {
+                Error::InsufficientBitcoins { needed, available }
+            }
+            _ => Error::from(InternalError::from(e)),
+        })?;
+
+        let btc_change = psbt
+            .unsigned_tx
+            .output
+            .iter()
+            .enumerate()
+            .find(|(_, o)| o.script_pubkey == change_addr)
+            .map(|(i, o)| BtcChange {
+                vout: i as u32,
+                amount: o.value,
+            });
+
+        Ok((psbt, btc_change))
     }
 
     fn _try_prepare_psbt(
@@ -5140,55 +5207,76 @@ impl Wallet {
         all_inputs: &mut Vec<BdkOutPoint>,
         witness_recipients: &Vec<(ScriptBuf, u64)>,
         fee_rate: f32,
-    ) -> Result<BdkPsbt, Error> {
-        let psbt = loop {
+    ) -> Result<(BdkPsbt, Option<BtcChange>), Error> {
+        Ok(loop {
             break match self._prepare_psbt(all_inputs.clone(), witness_recipients, fee_rate) {
-                Ok(psbt) => psbt,
+                Ok(res) => res,
                 Err(Error::InsufficientBitcoins { .. }) => {
                     let used_txos: Vec<Outpoint> =
                         all_inputs.clone().into_iter().map(|o| o.into()).collect();
-                    if let Some(a) = self
-                        ._get_available_allocations(
-                            input_unspents.to_vec(),
-                            used_txos.clone(),
-                            Some(0),
-                        )?
-                        .pop()
-                    {
+                    let mut free_utxos = self._get_available_allocations(
+                        input_unspents.to_vec(),
+                        used_txos.clone(),
+                        Some(0),
+                    )?;
+                    // sort UTXOs by BTC amount
+                    if !free_utxos.is_empty() {
+                        // pre-parse BTC amounts to make sure no one will fail
+                        for u in &free_utxos {
+                            u.utxo
+                                .btc_amount
+                                .parse::<u64>()
+                                .map_err(|e| Error::Internal {
+                                    details: e.to_string(),
+                                })?;
+                        }
+                        free_utxos.sort_by_key(|u| u.utxo.btc_amount.parse::<u64>().unwrap());
+                    }
+                    if let Some(a) = free_utxos.pop() {
                         all_inputs.push(a.utxo.into());
                         continue;
-                    } else {
-                        return Err(self._detect_btc_unspendable_err()?);
                     }
+                    return Err(self._detect_btc_unspendable_err()?);
                 }
                 Err(e) => return Err(e),
             };
-        };
-        Ok(psbt)
+        })
     }
 
-    fn _get_change_utxo(
+    fn _get_change_seal(
         &self,
+        btc_change: &Option<BtcChange>,
         change_utxo_option: &mut Option<DbTxo>,
         change_utxo_idx: &mut Option<i32>,
         input_outpoints: Vec<OutPoint>,
         unspents: Vec<LocalUnspent>,
-    ) -> Result<DbTxo, Error> {
-        if change_utxo_option.is_none() {
-            let change_utxo = self._get_utxo(
-                input_outpoints.into_iter().map(|t| t.into()).collect(),
-                Some(unspents),
-                true,
-            )?;
-            debug!(
-                self.logger,
-                "Change outpoint '{}'",
-                change_utxo.outpoint().to_string()
+    ) -> Result<GraphSeal, Error> {
+        let graph_seal = if let Some(btc_change) = btc_change {
+            GraphSeal::new_vout(CloseMethod::OpretFirst, btc_change.vout)
+        } else {
+            if change_utxo_option.is_none() {
+                let change_utxo = self._get_utxo(
+                    input_outpoints.into_iter().map(|t| t.into()).collect(),
+                    Some(unspents),
+                    true,
+                )?;
+                debug!(
+                    self.logger,
+                    "Change outpoint '{}'",
+                    change_utxo.outpoint().to_string()
+                );
+                *change_utxo_idx = Some(change_utxo.idx);
+                *change_utxo_option = Some(change_utxo);
+            }
+            let change_utxo = change_utxo_option.clone().unwrap();
+            let blind_seal = ExplicitSeal::with(
+                CloseMethod::OpretFirst,
+                RgbTxid::from_str(&change_utxo.txid).unwrap().into(),
+                change_utxo.vout,
             );
-            *change_utxo_idx = Some(change_utxo.idx);
-            *change_utxo_option = Some(change_utxo);
-        }
-        Ok(change_utxo_option.clone().unwrap())
+            GraphSeal::from(blind_seal)
+        };
+        Ok(graph_seal)
     }
 
     fn _prepare_rgb_psbt(
@@ -5201,6 +5289,7 @@ impl Wallet {
         unspents: Vec<LocalUnspent>,
         runtime: &mut RgbRuntime,
         min_confirmations: u8,
+        btc_change: Option<BtcChange>,
     ) -> Result<(), Error> {
         let mut change_utxo_option = None;
         let mut change_utxo_idx = None;
@@ -5238,18 +5327,13 @@ impl Wallet {
             }
 
             if change_amount > 0 {
-                let change_utxo = self._get_change_utxo(
+                let seal = self._get_change_seal(
+                    &btc_change,
                     &mut change_utxo_option,
                     &mut change_utxo_idx,
                     input_outpoints.clone(),
                     unspents.clone(),
                 )?;
-                let seal = ExplicitSeal::with(
-                    CloseMethod::OpretFirst,
-                    RgbTxid::from_str(&change_utxo.txid).unwrap().into(),
-                    change_utxo.vout,
-                );
-                let seal = GraphSeal::from(seal);
                 let change = TypedState::Amount(change_amount);
                 asset_transition_builder = asset_transition_builder
                     .add_raw_state(assignment_id, seal, change)
@@ -5342,18 +5426,13 @@ impl Wallet {
                 if let TypedState::Amount(amt) = &state {
                     moved_amount += amt
                 }
-                let change_utxo = self._get_change_utxo(
+                let seal = self._get_change_seal(
+                    &btc_change,
                     &mut change_utxo_option,
                     &mut change_utxo_idx,
                     input_outpoints.clone(),
                     unspents.clone(),
                 )?;
-                let seal = ExplicitSeal::with(
-                    CloseMethod::OpretFirst,
-                    RgbTxid::from_str(&change_utxo.txid).unwrap().into(),
-                    change_utxo.vout,
-                );
-                let seal = GraphSeal::from(seal);
                 blank_builder = blank_builder
                     .add_input(opout)
                     .map_err(InternalError::from)?
@@ -5430,6 +5509,7 @@ impl Wallet {
 
         // save batch transfer data to file (for send_end)
         let info_contents = InfoBatchTransfer {
+            btc_change,
             change_utxo_idx,
             blank_allocations,
             donation,
@@ -5485,25 +5565,25 @@ impl Wallet {
                         return Err(Error::RecipientIDAlreadyUsed)?;
                     }
                     continue;
-                } else if consignment_res.result.is_none() {
-                    continue;
-                } else {
-                    for media in &medias {
-                        let media_res = self.rest_client.clone().post_media(
-                            &proxy_url,
-                            media.get_digest(),
-                            &media.file_path,
-                        )?;
-                        debug!(self.logger, "Attachment POST response: {:?}", media_res);
-                        if let Some(_err) = media_res.error {
-                            return Err(InternalError::Unexpected)?;
-                        }
-                    }
-
-                    transport_endpoint.used = true;
-                    found_valid = true;
-                    break;
                 }
+                if consignment_res.result.is_none() {
+                    continue;
+                }
+                for media in &medias {
+                    let media_res = self.rest_client.clone().post_media(
+                        &proxy_url,
+                        media.get_digest(),
+                        &media.file_path,
+                    )?;
+                    debug!(self.logger, "Attachment POST response: {:?}", media_res);
+                    if let Some(_err) = media_res.error {
+                        return Err(InternalError::Unexpected)?;
+                    }
+                }
+
+                transport_endpoint.used = true;
+                found_valid = true;
+                break;
             }
             if !found_valid {
                 return Err(Error::NoValidTransportEndpoint);
@@ -5519,6 +5599,8 @@ impl Wallet {
         transfer_info_map: BTreeMap<String, InfoAssetTransfer>,
         blank_allocations: HashMap<String, u64>,
         change_utxo_idx: Option<i32>,
+        btc_change: Option<BtcChange>,
+        broadcasted: bool,
         status: TransferStatus,
         min_confirmations: u8,
     ) -> Result<i32, Error> {
@@ -5526,7 +5608,7 @@ impl Wallet {
         let expiration = Some(created_at + DURATION_SEND_TRANSFER);
 
         let batch_transfer = DbBatchTransferActMod {
-            txid: ActiveValue::Set(Some(txid)),
+            txid: ActiveValue::Set(Some(txid.clone())),
             status: ActiveValue::Set(status),
             expiration: ActiveValue::Set(expiration),
             created_at: ActiveValue::Set(created_at),
@@ -5534,6 +5616,31 @@ impl Wallet {
             ..Default::default()
         };
         let batch_transfer_idx = self.database.set_batch_transfer(batch_transfer)?;
+
+        let change_utxo_idx = if let Some(btc_change) = btc_change {
+            Some(if broadcasted {
+                let db_txo = self
+                    .database
+                    .get_txo(&Outpoint {
+                        txid: txid.clone(),
+                        vout: btc_change.vout,
+                    })?
+                    .expect("outpoint should be in the DB");
+                db_txo.idx
+            } else {
+                let db_utxo = DbTxoActMod {
+                    txid: ActiveValue::Set(txid.clone()),
+                    vout: ActiveValue::Set(btc_change.vout),
+                    btc_amount: ActiveValue::Set(btc_change.amount.to_string()),
+                    spent: ActiveValue::Set(false),
+                    exists: ActiveValue::Set(false),
+                    ..Default::default()
+                };
+                self.database.set_txo(db_utxo)?
+            })
+        } else {
+            change_utxo_idx
+        };
 
         for (asset_id, transfer_info) in transfer_info_map {
             let asset_spend = transfer_info.asset_spend;
@@ -5616,6 +5723,7 @@ impl Wallet {
         // - incoming and pending
         // - outgoing and in waiting counterparty status
         // - pending incoming witness
+        // - inexistent
         input_unspents.retain(|u| {
             !((u.rgb_allocations
                 .iter()
@@ -5625,7 +5733,8 @@ impl Wallet {
                     .iter()
                     .any(|a| !a.incoming && a.status.waiting_counterparty()))
                 || (!pending_witness_outpoints.is_empty()
-                    && pending_witness_outpoints.contains(&u.outpoint())))
+                    && pending_witness_outpoints.contains(&u.outpoint()))
+                || !u.utxo.exists)
         });
         Ok(input_unspents)
     }
@@ -5829,7 +5938,7 @@ impl Wallet {
             .concat();
         all_inputs.sort();
         all_inputs.dedup();
-        let psbt = self._try_prepare_psbt(
+        let (psbt, _) = self._try_prepare_psbt(
             &input_unspents,
             &mut all_inputs,
             &witness_recipients,
@@ -5837,7 +5946,7 @@ impl Wallet {
         )?;
         let vbytes = psbt.extract_tx().vsize() as f32;
         let updated_fee_rate = ((vbytes + OPRET_VBYTES) / vbytes) * fee_rate;
-        let psbt = self._try_prepare_psbt(
+        let (psbt, btc_change) = self._try_prepare_psbt(
             &input_unspents,
             &mut all_inputs,
             &witness_recipients,
@@ -5862,6 +5971,7 @@ impl Wallet {
             unspents,
             &mut runtime,
             min_confirmations,
+            btc_change,
         )?;
 
         // rename transfer directory
@@ -5898,9 +6008,6 @@ impl Wallet {
         let serialized_info = fs::read_to_string(info_file)?;
         let info_contents: InfoBatchTransfer =
             serde_json::from_str(&serialized_info).map_err(InternalError::from)?;
-        let blank_allocations = info_contents.blank_allocations;
-        let change_utxo_idx = info_contents.change_utxo_idx;
-        let donation = info_contents.donation;
         let mut medias = None;
         let mut tokens = None;
         let mut token_medias = None;
@@ -5950,7 +6057,7 @@ impl Wallet {
         }
 
         // broadcast PSBT if donation and finally save transfer to DB
-        let status = if donation {
+        let status = if info_contents.donation {
             self._broadcast_psbt(psbt)?;
             TransferStatus::WaitingConfirmations
         } else {
@@ -5959,8 +6066,10 @@ impl Wallet {
         let batch_transfer_idx = self._save_transfers(
             txid.clone(),
             transfer_info_map,
-            blank_allocations,
-            change_utxo_idx,
+            info_contents.blank_allocations,
+            info_contents.change_utxo_idx,
+            info_contents.btc_change,
+            info_contents.donation,
             status,
             info_contents.min_confirmations,
         )?;

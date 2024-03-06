@@ -112,10 +112,7 @@ fn fail() {
     let mut wallet_data_bad = wallet_data.clone();
     wallet_data_bad.data_dir = s!("");
     let result = Wallet::new(wallet_data_bad);
-    assert!(matches!(result, Err(Error::IO { details: _ })));
-    if let Err(Error::IO { details: err }) = result {
-        assert_eq!(err, "No such file or directory (os error 2)");
-    }
+    assert!(matches!(result, Err(Error::InexistentDataDir)));
 
     // pubkey too short
     let mut wallet_data_bad = wallet_data.clone();
@@ -138,13 +135,20 @@ fn fail() {
     assert!(matches!(result, Err(Error::InvalidMnemonic { details: _ })));
 
     // invalid vanilla keychain
-    let mut wallet_data_bad = wallet_data;
+    let mut wallet_data_bad = wallet_data.clone();
     wallet_data_bad.vanilla_keychain = Some(KEYCHAIN_RGB_OPRET);
     let result = Wallet::new(wallet_data_bad.clone());
     assert!(matches!(result, Err(Error::InvalidVanillaKeychain)));
     wallet_data_bad.vanilla_keychain = Some(KEYCHAIN_RGB_TAPRET);
     let result = Wallet::new(wallet_data_bad);
     assert!(matches!(result, Err(Error::InvalidVanillaKeychain)));
+
+    // invalid bitcoin keys
+    let mut wallet_data_bad = wallet_data;
+    let alt_keys = generate_keys(BitcoinNetwork::Regtest);
+    wallet_data_bad.pubkey = alt_keys.xpub;
+    let result = Wallet::new(wallet_data_bad.clone());
+    assert!(matches!(result, Err(Error::InvalidBitcoinKeys)));
 }
 
 #[test]

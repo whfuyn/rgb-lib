@@ -349,7 +349,7 @@ fn success() {
     assert_eq!(transfer_data.status, TransferStatus::Settled);
     let unspents = test_list_unspents(&wallet, None, false);
     let unspents_color_count_after = unspents.iter().filter(|u| u.utxo.colorable).count();
-    assert_eq!(unspents_color_count_after, unspents_color_count_before - 1);
+    assert_eq!(unspents_color_count_after, unspents_color_count_before - 2);
 }
 
 #[test]
@@ -2379,42 +2379,6 @@ fn fail() {
     // wallets
     let (wallet, online) = get_funded_wallet!();
     let (rcv_wallet, _rcv_online) = get_funded_wallet!();
-    let mut wallet_1_alloc = get_test_wallet(true, Some(1));
-    let online_1_alloc = test_go_online(&mut wallet_1_alloc, true, None);
-
-    // cannot send if no available allocations for change (max 1 allocation per UTXO)
-    fund_wallet(test_get_address(&wallet_1_alloc));
-    mine(false);
-    test_create_utxos(
-        &wallet_1_alloc,
-        &online_1_alloc,
-        true,
-        Some(1),
-        None,
-        FEE_RATE,
-    );
-    let asset_1_alloc = test_issue_asset_nia(&wallet_1_alloc, &online_1_alloc, None);
-    let receive_data = rcv_wallet
-        .blind_receive(
-            None,
-            None,
-            Some(60),
-            TRANSPORT_ENDPOINTS.clone(),
-            MIN_CONFIRMATIONS,
-        )
-        .unwrap();
-    let recipient_map = HashMap::from([(
-        asset_1_alloc.asset_id,
-        vec![Recipient {
-            amount: AMOUNT / 2,
-            recipient_data: RecipientData::BlindedUTXO(
-                SecretSeal::from_str(&receive_data.recipient_id).unwrap(),
-            ),
-            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
-        }],
-    )]);
-    let result = test_send_result(&wallet_1_alloc, &online_1_alloc, &recipient_map);
-    assert!(matches!(result, Err(Error::InsufficientAllocationSlots)));
 
     // issue asset
     let asset = test_issue_asset_nia(&wallet, &online, None);
@@ -2559,6 +2523,30 @@ fn fail() {
         result,
         Err(Error::InvalidTransportEndpoints { details: m }) if m == msg
     ));
+
+    // transport endpoints: no valid endpoints
+    let transport_endpoints = vec![format!("rpc://{PROXY_HOST_MOD_API}")];
+    let receive_data_te = rcv_wallet
+        .blind_receive(
+            None,
+            None,
+            None,
+            transport_endpoints.clone(),
+            MIN_CONFIRMATIONS,
+        )
+        .unwrap();
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            recipient_data: RecipientData::BlindedUTXO(
+                SecretSeal::from_str(&receive_data_te.recipient_id).unwrap(),
+            ),
+            amount: AMOUNT / 2,
+            transport_endpoints,
+        }],
+    )]);
+    let result = test_send_result(&wallet, &online, &recipient_map);
+    assert!(matches!(result, Err(Error::NoValidTransportEndpoint)));
 
     // fee min/max
     let recipient_map = HashMap::from([(
@@ -2715,35 +2703,67 @@ fn pending_outgoing_transfer_fail() {
 
     // wallets
     let (wallet, online) = get_funded_wallet!();
-    let (rcv_wallet, rcv_online) = get_funded_wallet!();
+    let (rcv_wallet, rcv_online) = get_empty_wallet!();
 
     // issue asset
     let asset = test_issue_asset_nia(&wallet, &online, None);
 
     // 1st send
-    let receive_data = test_blind_receive(&rcv_wallet);
+    let receive_data = test_witness_receive(&rcv_wallet);
     let recipient_map = HashMap::from([(
         asset.asset_id.clone(),
         vec![Recipient {
-            recipient_data: RecipientData::BlindedUTXO(
-                SecretSeal::from_str(&receive_data.recipient_id).unwrap(),
-            ),
             amount,
+            recipient_data: RecipientData::WitnessData {
+                script_buf: ScriptBuf::from_hex(&receive_data.recipient_id.clone()).unwrap(),
+                amount_sat: 1000,
+                blinding: None,
+            },
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
     )]);
     let txid = test_send(&wallet, &online, &recipient_map);
     assert!(!txid.is_empty());
 
+    show_unspent_colorings(&wallet, "sender after 1st send");
+
+    // check change UTXO has exists = false and unspents list it
+    let (transfer, _, _) = get_test_transfer_sender(&wallet, &txid);
+    let (transfer_data, _) = get_test_transfer_data(&wallet, &transfer);
+    let unspents = test_list_unspents(&wallet, Some(&online), false);
+    let change_unspent = unspents
+        .iter()
+        .find(|u| Some(u.utxo.outpoint.clone()) == transfer_data.change_utxo)
+        .unwrap();
+    assert!(!change_unspent.utxo.exists);
+    assert_eq!(unspents.len(), UTXO_NUM as usize + 2);
+    assert_eq!(
+        unspents
+            .iter()
+            .filter(|u| u.utxo.colorable && u.utxo.exists)
+            .count(),
+        UTXO_NUM as usize
+    );
+    assert_eq!(
+        unspents
+            .iter()
+            .filter(|u| u.utxo.colorable && !u.utxo.exists)
+            .count(),
+        1
+    );
+    assert_eq!(unspents.iter().filter(|u| !u.utxo.colorable).count(), 1);
+
     // 2nd send (1st still pending)
-    let receive_data = test_blind_receive(&rcv_wallet);
+    let receive_data = test_witness_receive(&rcv_wallet);
     let recipient_map = HashMap::from([(
         asset.asset_id.clone(),
         vec![Recipient {
-            recipient_data: RecipientData::BlindedUTXO(
-                SecretSeal::from_str(&receive_data.recipient_id).unwrap(),
-            ),
             amount: amount / 2,
+            recipient_data: RecipientData::WitnessData {
+                script_buf: ScriptBuf::from_hex(&receive_data.recipient_id.clone()).unwrap(),
+                amount_sat: 1000,
+                blinding: None,
+            },
             transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
         }],
     )]);
@@ -4322,4 +4342,164 @@ fn spend_witness_receive_utxo() {
         matches!(result, Err(Error::InsufficientSpendableAssets { asset_id: ref id })
             if id == &asset_b.asset_id )
     );
+}
+
+#[test]
+#[parallel]
+fn rgb_change_on_btc_change() {
+    initialize();
+
+    let amount: u64 = 66;
+
+    // wallets
+    let (wallet, online) = get_funded_noutxo_wallet!();
+    let (rcv_wallet, rcv_online) = get_funded_wallet!();
+
+    // issue
+    test_create_utxos(&wallet, &online, false, Some(1), None, FEE_RATE);
+    let asset = test_issue_asset_nia(&wallet, &online, None);
+
+    // send with no available colorable UTXOs (need to allocate change to BTC change UTXO)
+    let receive_data = test_blind_receive(&rcv_wallet);
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            amount,
+            recipient_data: RecipientData::BlindedUTXO(
+                SecretSeal::from_str(&receive_data.recipient_id).unwrap(),
+            ),
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let txid = test_send(&wallet, &online, &recipient_map);
+    assert!(!txid.is_empty());
+
+    // RGB change has been allocated to the same UTXO as the BTC change (exists = false)
+    let (transfer, _, _) = get_test_transfer_sender(&wallet, &txid);
+    let (transfer_data, _) = get_test_transfer_data(&wallet, &transfer);
+    let unspents = test_list_unspents(&wallet, None, false);
+    assert_eq!(
+        unspents
+            .iter()
+            .filter(|u| u.utxo.colorable)
+            .collect::<Vec<&Unspent>>()
+            .len(),
+        2
+    );
+    let change_unspent = unspents
+        .into_iter()
+        .find(|u| Some(u.utxo.outpoint.clone()) == transfer_data.change_utxo)
+        .unwrap();
+    assert!(!change_unspent.utxo.exists);
+    let change_rgb_allocations = change_unspent.rgb_allocations;
+    assert_eq!(change_rgb_allocations.len(), 1);
+    let allocation = change_rgb_allocations.first().unwrap();
+    assert_eq!(allocation.asset_id, Some(asset.asset_id));
+    assert_eq!(allocation.amount, AMOUNT - amount);
+
+    stop_mining();
+
+    // transfers progress to status WaitingConfirmations after a refresh
+    test_refresh_all(&rcv_wallet, &rcv_online);
+    let rcv_transfer = get_test_transfer_recipient(&rcv_wallet, &receive_data.recipient_id);
+    let (rcv_transfer_data, _) = get_test_transfer_data(&rcv_wallet, &rcv_transfer);
+    test_refresh_all(&wallet, &online);
+    let (transfer, _, _) = get_test_transfer_sender(&wallet, &txid);
+    let (transfer_data, _) = get_test_transfer_data(&wallet, &transfer);
+
+    assert_eq!(
+        rcv_transfer_data.status,
+        TransferStatus::WaitingConfirmations
+    );
+    assert_eq!(transfer_data.status, TransferStatus::WaitingConfirmations);
+
+    // transfers progress to status Settled after tx mining + refresh
+    mine(true);
+    test_refresh_all(&rcv_wallet, &rcv_online);
+    test_refresh_all(&wallet, &online);
+
+    let rcv_transfer = get_test_transfer_recipient(&rcv_wallet, &receive_data.recipient_id);
+    let (rcv_transfer_data, _) = get_test_transfer_data(&rcv_wallet, &rcv_transfer);
+    let (transfer, _, _) = get_test_transfer_sender(&wallet, &txid);
+    let (transfer_data, _) = get_test_transfer_data(&wallet, &transfer);
+    assert_eq!(rcv_transfer_data.status, TransferStatus::Settled);
+    assert_eq!(transfer_data.status, TransferStatus::Settled);
+}
+
+#[test]
+#[parallel]
+fn no_inexistent_utxos() {
+    initialize();
+
+    let amount: u64 = 66;
+
+    // wallets
+    let (wallet, online) = get_funded_noutxo_wallet!();
+    let (rcv_wallet, _) = get_empty_wallet!();
+
+    // create 1 UTXO
+    let size = Some(UTXO_SIZE * 2);
+    let num_utxos_created = test_create_utxos(&wallet, &online, true, Some(1), size, FEE_RATE);
+    assert_eq!(num_utxos_created, 1);
+
+    // issue
+    let asset = test_issue_asset_nia(&wallet, &online, Some(&[AMOUNT]));
+
+    // send
+    let receive_data = test_witness_receive(&rcv_wallet);
+    let recipient_map = HashMap::from([(
+        asset.asset_id.clone(),
+        vec![Recipient {
+            amount,
+            recipient_data: RecipientData::WitnessData {
+                script_buf: ScriptBuf::from_hex(&receive_data.recipient_id).unwrap(),
+                amount_sat: UTXO_SIZE as u64,
+                blinding: None,
+            },
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let txid = test_send(&wallet, &online, &recipient_map);
+    assert!(!txid.is_empty());
+
+    show_unspent_colorings(&wallet, "after send (WaitingCounterparty)");
+
+    // 1 UTXO being spent, 1 UTXO with exists = false
+    // trying to get an UTXO for a blind receive should fail
+    let result = test_blind_receive_result(&wallet);
+    assert!(matches!(result, Err(Error::InsufficientAllocationSlots)));
+    // trying to issue an asset should fail
+    let result = test_issue_asset_nia_result(&wallet, &online, None);
+    assert!(matches!(result, Err(Error::InsufficientAllocationSlots)));
+    let result = test_issue_asset_cfa_result(&wallet, &online, None, None);
+    assert!(matches!(result, Err(Error::InsufficientAllocationSlots)));
+    let result = test_issue_asset_uda_result(&wallet, &online, None, None, vec![]);
+    assert!(matches!(result, Err(Error::InsufficientAllocationSlots)));
+    // trying to create 1 UTXO with up_to = true should create 1
+    let num_utxos_created = test_create_utxos(&wallet, &online, true, Some(1), None, FEE_RATE);
+    assert_eq!(num_utxos_created, 1);
+
+    // 1 UTXO being spent, 1 UTXO with exists = false, 1 new UTXO
+    // issuing an asset should now succeed
+    let asset_2 = test_issue_asset_nia(&wallet, &online, Some(&[AMOUNT * 2]));
+
+    show_unspent_colorings(&wallet, "after 2nd issue");
+
+    // 1 UTXO being spent, 1 UTXO with exists = false, 1 UTXO with an allocated asset
+    // trying to send more BTC than what's available in the UTXO being spent should fail
+    let receive_data = test_witness_receive(&rcv_wallet);
+    let recipient_map = HashMap::from([(
+        asset_2.asset_id.clone(),
+        vec![Recipient {
+            amount,
+            recipient_data: RecipientData::WitnessData {
+                script_buf: ScriptBuf::from_hex(&receive_data.recipient_id).unwrap(),
+                amount_sat: UTXO_SIZE as u64,
+                blinding: None,
+            },
+            transport_endpoints: TRANSPORT_ENDPOINTS.clone(),
+        }],
+    )]);
+    let result = test_send_begin_result(&wallet, &online, &recipient_map);
+    assert!(matches!(result, Err(Error::InsufficientAllocationSlots)));
 }
