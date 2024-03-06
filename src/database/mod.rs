@@ -245,11 +245,15 @@ impl LocalRgbAllocation {
     }
 }
 
+/// UTXO and its rgb allocation
 #[derive(Debug, Clone)]
 pub struct UtxoAllocation {
+    /// Transaction ID
     pub txid: String,
+    /// Output index
     pub vout: u32,
 
+    /// Settled balance
     pub settled: u64,
 }
 
