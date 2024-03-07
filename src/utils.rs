@@ -169,7 +169,8 @@ fn get_coin_type(bitcoin_network: BitcoinNetwork) -> u32 {
     u32::from(bitcoin_network != BitcoinNetwork::Mainnet)
 }
 
-pub(crate) fn derive_account_xprv_from_mnemonic(
+/// Derive account xprv from mnemonic
+pub fn derive_account_xprv_from_mnemonic(
     bitcoin_network: BitcoinNetwork,
     mnemonic: &str,
 ) -> Result<ExtendedPrivKey, Error> {
@@ -185,7 +186,8 @@ pub(crate) fn derive_account_xprv_from_mnemonic(
     Ok(master_xprv.derive_priv(&Secp256k1::new(), &account_derivation_path)?)
 }
 
-pub(crate) fn get_xpub_from_xprv(xprv: &ExtendedPrivKey) -> ExtendedPubKey {
+/// Get xpub from xprv
+pub fn get_xpub_from_xprv(xprv: &ExtendedPrivKey) -> ExtendedPubKey {
     ExtendedPubKey::from_priv(&Secp256k1::new(), xprv)
 }
 
