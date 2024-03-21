@@ -212,7 +212,7 @@ impl AssetIface {
         let issued_supply = asset.issued_supply.parse::<u64>().unwrap();
         Ok(match &self {
             AssetIface::RGB20 => AssetType::Nia(AssetNIA {
-                asset_id: asset.id.clone(),
+                asset_id: asset.asset_id.clone(),
                 asset_iface: self.clone(),
                 ticker: asset.ticker.clone().unwrap(),
                 name: asset.name.clone(),
@@ -225,7 +225,7 @@ impl AssetIface {
                 media,
             }),
             AssetIface::RGB21 => AssetType::Uda(AssetUDA {
-                asset_id: asset.id.clone(),
+                asset_id: asset.asset_id.clone(),
                 asset_iface: self.clone(),
                 details: asset.details.clone(),
                 ticker: asset.ticker.clone().unwrap(),
@@ -238,7 +238,7 @@ impl AssetIface {
                 token,
             }),
             AssetIface::RGB25 => AssetType::Cfa(AssetCFA {
-                asset_id: asset.id.clone(),
+                asset_id: asset.asset_id.clone(),
                 asset_iface: self.clone(),
                 name: asset.name.clone(),
                 details: asset.details.clone(),
@@ -1652,7 +1652,7 @@ impl Wallet {
             .iter_mut()
             .for_each(|u| u.rgb_allocations.retain(|a| !a.status.failed()));
         let max_allocs = max_allocations.unwrap_or(self.max_allocations_per_utxo - 1);
-        Ok(mut_unspents
+        let ret = dbg!(mut_unspents)
             .iter()
             .filter(|u| !exclude_utxos.contains(&u.utxo.outpoint()))
             .filter(|u| {
@@ -1663,7 +1663,8 @@ impl Wallet {
                         .any(|a| !a.incoming && a.status.waiting_counterparty())
             })
             .cloned()
-            .collect())
+            .collect();
+        Ok(dbg!(ret))
     }
 
     fn _detect_btc_unspendable_err(&self) -> Result<Error, Error> {
@@ -5857,7 +5858,7 @@ impl Wallet {
         // prepare RGB PSBT
         self._prepare_rgb_psbt(
             &mut psbt,
-            all_inputs,
+            dbg!(all_inputs),
             transfer_info_map.clone(),
             transfer_dir.clone(),
             donation,
